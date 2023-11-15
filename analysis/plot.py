@@ -83,7 +83,7 @@ def firing_rate(spikes_df, num_cells=None, time_windows=(0.,), frequency=True):
     n, N = 0, time_windows.size
     count = False
     for t, i in zip(spikes_df['timestamps'], spikes_df['node_ids']):
-        while t > time_windows[n] and n < N:
+        while n < N and t > time_windows[n]:
             n += 1
             count = not count
         if count:
