@@ -29,4 +29,6 @@ def population_statistics(data, stats={'mean': np.mean, 'stdev': np.std}):
     data: dict('pop_name': data_array). Dictionary of data for populations.
     stats: dict('statistics': function). Dictionary of statistics name and function pairs.
     """
-    return pd.DataFrame({name: map(func, data.values()) for name, func in stats.items()}, index=data.keys())
+    df = pd.DataFrame({name: map(func, data.values()) for name, func in stats.items()},
+                      index=pd.Index(data.keys(), name='pop_name'))
+    return df

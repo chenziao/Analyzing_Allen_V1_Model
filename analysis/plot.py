@@ -30,11 +30,11 @@ def raster(pop_spike, pop_color, id_column='node_ids', s=0.1, ax=None):
 
 def firing_rate_histogram(pop_fr, pop_color, bins=30, min_fr=None,
                           logscale=False, stacked=True, ax=None):
-    if min_fr is not None:
+    if logscale and min_fr is not None:
         pop_fr = {p: np.fmax(fr, min_fr) for p, fr in pop_fr.items()}
     fr = np.concatenate(list(pop_fr.values()))
     if logscale:
-        fr = fr[np.nonzero(fr)[0]]
+        fr = fr[fr > 0]
         bins = np.geomspace(fr.min(), fr.max(), bins + 1)
     else:
         bins = np.linspace(fr.min(), fr.max(), bins + 1)
