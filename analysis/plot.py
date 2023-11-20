@@ -1,7 +1,12 @@
 import numpy as np
 import pandas as pd
+import xarray as xr
 import scipy.signal as ss
 import matplotlib.pyplot as plt
+
+import pywt
+from fooof import FOOOF
+from fooof.sim.gen import gen_aperiodic, gen_model
 
 
 pop_color = {'e': 'red', 'Pvalb': 'blue', 'Sst': 'green', 'Htr3a': 'purple'}
@@ -209,8 +214,6 @@ def plot_stimulus_cycles(t, x, stim_cycle, dv_n_sigma=5.,
 def fit_fooof(f, pxx, aperiodic_mode='fixed', dB_threshold=3., max_n_peaks=10,
               freq_range=None, peak_width_limits=None, report=False,
               plot=False, plt_log=False, plt_range=None, figsize=None):
-    from fooof import FOOOF
-
     if aperiodic_mode != 'knee':
         aperiodic_mode = 'fixed'
     def set_range(x, upper=f[-1]):        
@@ -244,9 +247,37 @@ def fit_fooof(f, pxx, aperiodic_mode='fixed', dB_threshold=3., max_n_peaks=10,
     return results, fm
 
 
-def psd_residual(f, pxx, fooof_result, plot=False, plt_log=False, plt_range=None, ax=None):
-    from fooof.sim.gen import gen_model
+def plot_channel_psd(psd, channel_id=None, freq_range=200., plt_range=(0, 100.), figsize=(5, 4),
+                 aperiodic_mode='knee', dB_threshold=3., max_n_peaks=10, plt_log=True):
+    """Plot PSD at given chennel with FOOOF results"""
+    plt_range = np.array(plt_range)
+    if plt_range.size == 1:
+        plt_range = (0, plt_range.item())
+    psd_plt = psd.sel(frequency=slice(*plt_range))
+    plt.rcParams['axes.prop_cycle'] = plt.cycler('color',
+        plt.cm.get_cmap('plasma')(np.linspace(0, 1, psd.coords['channel'].size)))
+    plt.figure(figsize=figsize)
+    plt.plot(psd_plt.frequency, psd_plt.values.T, label=psd_plt.channel.values)
+    plt.xlim(plt_range)
+    plt.yscale('log')
+    plt.legend(loc='upper right', framealpha=0.2, title='channel ID')
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('Power')
+    fig1 = plt.gcf()
 
+    if channel_id is None:
+        channel_id = psd.channel[0]
+    print(f'Channel: {channel_id: d}')
+    psd_plt = psd.sel(channel=channel_id)
+    results = fit_fooof(psd_plt.frequency.values, psd_plt.values,
+                        aperiodic_mode=aperiodic_mode, dB_threshold=dB_threshold, max_n_peaks=max_n_peaks,
+                        freq_range=freq_range, peak_width_limits=None, report=True,
+                        plot=True, plt_log=plt_log, plt_range=plt_range[1], figsize=figsize)
+    fig2 = plt.gcf()
+    return results, fig1, fig2
+
+
+def psd_residual(f, pxx, fooof_result, plot=False, plt_log=False, plt_range=None, ax=None):
     full_fit, _, ap_fit = gen_model(f[1:], fooof_result.aperiodic_params,
                                     fooof_result.gaussian_params, return_components=True)
     full_fit, ap_fit = 10 ** full_fit, 10 ** ap_fit
@@ -272,11 +303,78 @@ def psd_residual(f, pxx, fooof_result, plot=False, plt_log=False, plt_range=None
     return res_psd, res_fit
 
 
-def plot_spectrogram(x, fs, tseg, tres=np.inf, remove_aperiodic=None,
-                     plt_log=False, plt_range=None, ax=None):
-    nfft = int(tseg * fs) # steps per segment
-    noverlap = int(max(tseg - tres, 0) * fs)
-    f, t, sxx = ss.spectrogram(x, fs=fs, nperseg=nfft, noverlap=noverlap, window='boxcar')
+# cone of influence in frequency for cmorxx-1.0 wavelet
+f0 = 2 * np.pi
+CMOR_COI = 2 ** -0.5
+CMOR_FLAMBDA = 4 * np.pi / (f0 + (2 + f0 ** 2) ** 0.5)
+COI_FREQ = 1 / (CMOR_COI * CMOR_FLAMBDA)
+
+def cwt_spectrogram(x, fs, nNotes=6, nOctaves=np.inf, freq_range=(0, np.inf),
+                    bandwidth=1.0, axis=-1, detrend=False, normalize=False):
+    """Calculate spectrogram using continuous wavelet transform"""
+    x = np.asarray(x)
+    N = x.shape[axis]
+    times = np.arange(N) / fs
+    # detrend and normalize
+    if detrend:
+        x = ss.detrend(x, axis=axis, type='linear')
+    if normalize:
+        x = x / x.std()
+    # Define some parameters of our wavelet analysis. 
+    # range of scales (in time) that makes sense
+    # min = 2 (Nyquist frequency)
+    # max = np.floor(N/2)
+    nOctaves = min(nOctaves, np.log2(2 * np.floor(N / 2)))
+    scales = 2 ** (1 + np.arange(np.floor(nOctaves * nNotes)) / nNotes)
+    # cwt and the frequencies used. 
+    # Use the complex morelet with bw=2*bandwidth and center frequency of 1.0
+    # bandwidth is the sigma of the gaussian envelope
+    wavelet = 'cmor' + str(2 * bandwidth) + '-1.0'
+    frequencies = pywt.scale2frequency(wavelet, scales) * fs
+    scales = scales[(frequencies >= freq_range[0]) & (frequencies <= freq_range[1])]
+    coef, frequencies = pywt.cwt(x, scales[::-1], wavelet=wavelet, sampling_period=1 / fs, axis=axis)
+    power = np.real(coef * np.conj(coef)) # equivalent to power = np.abs(coef)**2
+    # cone of influence in terms of wavelength
+    coi = N / 2 - np.abs(np.arange(N) - (N - 1) / 2)
+    # cone of influence in terms of frequency
+    coif = COI_FREQ * fs / coi
+    return power, times, frequencies, coif
+
+
+def cwt_spectrogram_xarray(x, fs, axis=-1, downsample_fs=None, channel_coords=None, **cwt_kwargs):
+    """Calculate spectrogram using continuous wavelet transform and return an xarray.Dataset
+    x: input array
+    fs: sampling frequency
+    axis: dimension index of time axis in x
+    downsample_fs: downsample to the frequency if specified
+    channel_coords: dictionary of {coordinate name: index} for channels
+    cwt_kwargs: keyword arguments for cwt_spectrogram()
+    """
+    x = np.asarray(x)
+    T = x.shape[axis] # number of time points
+    t = np.arange(T) / fs
+    if downsample_fs is None or downsample_fs >= fs:
+        downsample_fs = fs
+        downsampled = x
+    else:
+        num = int(T * downsample_fs / fs)
+        downsample_fs = num / T * fs
+        downsampled, t = ss.resample(x, num=num, t=t, axis=axis)
+    downsampled = np.moveaxis(downsampled, axis, -1)
+    sxx, _, f, coif = cwt_spectrogram(downsampled, downsample_fs, **cwt_kwargs)
+    sxx = np.moveaxis(sxx, 0, -2) # shape (... , freq, time)
+    if channel_coords is None:
+        channel_coords = {f'dim_{i:d}': range(d) for i, d in enumerate(sxx.shape[:-2])}
+    sxx = xr.DataArray(sxx, coords={**channel_coords, 'frequency': f, 'time': t}).to_dataset(name='PSD')
+    sxx = sxx.assign(cone_of_influence_frequency=xr.DataArray(coif, coords={'time': t}))
+    return sxx
+
+def plot_spectrogram(sxx_xarray, remove_aperiodic=None, plt_log=False,
+                     plt_range=None, clr_freq_range=None, ax=None):
+    """Plot spectrogram. Determine color limits using value in frequency band clr_freq_range"""
+    sxx = sxx_xarray.PSD.values.copy()
+    t = sxx_xarray.time.values.copy()
+    f = sxx_xarray.frequency.values.copy()
 
     cbar_label = 'PSD' if remove_aperiodic is None else 'PSD Residual'
     if plt_log:
@@ -285,23 +383,32 @@ def plot_spectrogram(x, fs, tseg, tres=np.inf, remove_aperiodic=None,
         cbar_label += ' log(power)'
 
     if remove_aperiodic is not None:
-        from fooof.sim.gen import gen_aperiodic
-
-        ap_fit = gen_aperiodic(f[1:], remove_aperiodic.aperiodic_params)
-        sxx[1:, :] -= (ap_fit if plt_log else 10 ** ap_fit)[:, None]
-        sxx[0, :] = 0.
+        f1_idx = 0 if f[0] else 1
+        ap_fit = gen_aperiodic(f[f1_idx:], remove_aperiodic.aperiodic_params)
+        sxx[f1_idx:, :] -= (ap_fit if plt_log else 10 ** ap_fit)[:, None]
+        sxx[:f1_idx, :] = 0.
 
     if ax is None:
         _, ax = plt.subplots(1, 1)
     plt_range = np.array(f[-1]) if plt_range is None else np.array(plt_range)
     if plt_range.size == 1:
-        plt_range = [f[1] if plt_log else 0., plt_range.item()]
+        plt_range = [f[0 if f[0] else 1] if plt_log else 0., plt_range.item()]
     f_idx = (f >= plt_range[0]) & (f <= plt_range[1])
+    if clr_freq_range is None:
+        vmin, vmax = None, None
+    else:
+        c_idx = (f >= clr_freq_range[0]) & (f <= clr_freq_range[1])
+        vmin, vmax = sxx[c_idx, :].min(), sxx[c_idx, :].max()
 
-    pcm = ax.pcolormesh(t * 1000., f[f_idx], sxx[f_idx, :], shading='gouraud')
-    ax.set_ylim(plt_range)
+    f = f[f_idx]
+    pcm = ax.pcolormesh(t, f, sxx[f_idx, :], shading='gouraud', vmin=vmin, vmax=vmax)
+    if 'cone_of_influence_frequency' in sxx_xarray:
+        coif = sxx_xarray.cone_of_influence_frequency
+        ax.plot(t, coif)
+        ax.fill_between(t, coif, step='mid', alpha=0.2)
+    ax.set_xlim(t[0], t[-1])
+    ax.set_ylim(f[0], f[-1])
     plt.colorbar(mappable=pcm, ax=ax, label=cbar_label)
-    ax.set_xlabel('Time (ms)')
+    ax.set_xlabel('Time (sec)')
     ax.set_ylabel('Frequency (Hz)')
-
-    return f, t, sxx
+    return sxx
