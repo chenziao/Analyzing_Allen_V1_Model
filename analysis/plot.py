@@ -114,17 +114,20 @@ def pop_spike_rate(spike_times, time, frequeny=False):
 def xcorr_coeff(x, y, max_lag=None, dt=1., plot=True, ax=None):
     x = np.asarray(x)
     y = np.asarray(y)
-    xcorr = ss.correlate(x, y) / x.size / x.std() / y.std()
-    xcorr_lags = ss.correlation_lags(x.size, y.size)
+    x = (x - x.mean()) / x.std()
+    y = (y - y.mean()) / y.std()
+    xcorr = ss.correlate(x, y) / max(x.size, y.size)
+    xcorr_lags = dt * ss.correlation_lags(x.size, y.size)
     if max_lag is not None:
-        lag_idx = np.nonzero(np.abs(xcorr_lags) <= max_lag / dt)[0]
+        lag_idx = np.nonzero(np.abs(xcorr_lags) <= max_lag)[0]
         xcorr = xcorr[lag_idx]
         xcorr_lags = xcorr_lags[lag_idx]
 
     if plot:
         if ax is None:
             _, ax = plt.subplots(1, 1)
-        ax.plot(dt * xcorr_lags, xcorr)
+        ax.plot(xcorr_lags, xcorr)
+        ax.axvline(0., color='gray')
         ax.set_xlabel('Lag')
         ax.set_ylabel('Cross Correlation')
     return xcorr, xcorr_lags
