@@ -9,12 +9,13 @@ from fooof import FOOOF
 from fooof.sim.gen import gen_aperiodic, gen_model
 
 
+T_STOP = 3.0
 pop_color = {'e': 'red', 'Pvalb': 'blue', 'Sst': 'green', 'Htr3a': 'purple'}
 pop_color = {p: 'tab:' + clr for p, clr in pop_color.items()}
 pop_names = list(pop_color.keys())
-t_stop = 3.0
 
-def raster(pop_spike, pop_color, id_column='node_ids', s=0.1, ax=None):
+
+def raster(pop_spike, pop_color, id_column='node_ids', s=0.01, ax=None):
     if ax is None:
         _, ax = plt.subplots(1, 1)
     ymin, ymax = [], []
@@ -133,7 +134,7 @@ def xcorr_coeff(x, y, max_lag=None, dt=1., plot=True, ax=None):
     return xcorr, xcorr_lags
 
 
-def get_stim_cycle(on_time=0.5, off_time=0.5, t_start=0., t_stop=t_stop):
+def get_stim_cycle(on_time=0.5, off_time=0.5, t_start=0., t_stop=T_STOP):
     """Get burst input stimulus parameters, (duration, number) of cycles"""
     t_cycle = on_time + off_time
     n_cycle = int(np.floor((t_stop + off_time - t_start) / t_cycle))
@@ -141,7 +142,7 @@ def get_stim_cycle(on_time=0.5, off_time=0.5, t_start=0., t_stop=t_stop):
 
 
 def get_seg_on_stimulus(x, fs, on_time, off_time,
-                        t_start, t=t_stop, tseg=None):
+                        t_start, t=T_STOP, tseg=None):
     x = np.asarray(x)
     in_dim = x.ndim
     if in_dim == 1:
@@ -175,15 +176,16 @@ def get_seg_on_stimulus(x, fs, on_time, off_time,
 
 
 def get_psd_on_stimulus(x, fs, on_time, off_time,
-                        t_start, t=t_stop, tseg=None):
+                        t_start, t=T_STOP, tseg=None, axis=-1):
     x_on, nfft, stim_cycle = get_seg_on_stimulus(
         x, fs, on_time, off_time, t_start, t=t, tseg=tseg)
-    f, pxx = ss.welch(x_on, fs=fs, window='boxcar', nperseg=nfft, noverlap=0)
+    f, pxx = ss.welch(x_on, fs=fs, window='boxcar',
+                      nperseg=nfft, noverlap=0, axis=axis)
     return f, pxx, stim_cycle
 
 
 def get_coh_on_stimulus(x, y, fs, on_time, off_time,
-                        t_start, t=t_stop, tseg=None):
+                        t_start, t=T_STOP, tseg=None):
     xy = np.array([x, y])
     xy_on, nfft, _ = get_seg_on_stimulus(
         xy, fs, on_time, off_time, t_start, t=t, tseg=tseg)
@@ -192,26 +194,31 @@ def get_coh_on_stimulus(x, y, fs, on_time, off_time,
     return f, cxy
 
 
-def plot_stimulus_cycles(t, x, stim_cycle, dv_n_sigma=5.,
-                         var_label='LFP (mV)', ax=None):
+def plot_stimulus_cycles(t, x, stim_cycle, dv_n_sigma=5., var_label='LFP (mV)',
+                         fontsize=10, xytext=(.3, 0), ax=None):
     t_cycle, n_cycle = stim_cycle['t_cycle'], stim_cycle['n_cycle']
     t_start, on_time = stim_cycle['t_start'], stim_cycle['on_time']
     i_start, i_cycle = stim_cycle['i_start'], stim_cycle['i_cycle']
     dv = dv_n_sigma * np.std(x[i_start:])
+    r_edge = 1000 * t_cycle
     
     if ax is None:
         _, ax = plt.subplots(1, 1)
-    ax.plot(t[:i_start], x[:i_start] + n_cycle * dv, 'k', label='pre stimulus')
+    ax.plot(t[:i_start], x[:i_start] + n_cycle * dv, 'k')
+    ax.annotate('pre stimulus', (max(r_edge, x[i_start]), n_cycle * dv), color='k',
+                fontsize=fontsize, xytext=xytext, textcoords='offset fontsize')
     for i in range(n_cycle):
         m = i_start + i * i_cycle
-        xx = x[m:m + i_cycle] + (n_cycle - i - 1) * dv
-        ax.plot(t[:len(xx)], xx, label=f'stimulus {i + 1:d}')
+        offset = (n_cycle - i - 1) * dv
+        xx = x[m:m + i_cycle] + offset
+        h = ax.plot(t[:len(xx)], xx)
+        ax.annotate(f'stimulus {i + 1:d}', (r_edge, offset), color=h[0].get_color(),
+                    fontsize=fontsize, xytext=xytext, textcoords='offset fontsize')
     ax.axvline(on_time * 1000, color='gray', label='stimulus off')
-    ax.set_xlim(0, 1000 * max(1.25 * t_cycle, t_start))
-    ax.set_ylim(np.array((-2, n_cycle + 2)) * dv)
+    ax.set_xlim(0, max(1.15 * r_edge, 1000 * t_start))
+    ax.set_ylim(np.array((-1.5, n_cycle + 1.5)) * dv)
     ax.set_xlabel('Time (ms)')
     ax.set_ylabel(var_label)
-    ax.legend(loc='lower right', frameon=False)
 
 
 def fit_fooof(f, pxx, aperiodic_mode='fixed', dB_threshold=3., max_n_peaks=10,
@@ -229,7 +236,11 @@ def fit_fooof(f, pxx, aperiodic_mode='fixed', dB_threshold=3., max_n_peaks=10,
     fm = FOOOF(peak_width_limits=peak_width_limits, min_peak_height=dB_threshold / 10,
                peak_threshold=0., max_n_peaks=max_n_peaks, aperiodic_mode=aperiodic_mode)
     # Fit the model
-    fm.fit(f, pxx, freq_range)
+    try:
+        fm.fit(f, pxx, freq_range)
+    except Exception as e:
+        fl = np.linspace(f[0], f[-1], int((f[-1] - f[0]) / np.min(np.diff(f))) + 1)
+        fm.fit(fl, np.interp(fl, f, pxx), freq_range)
     results = fm.get_results()
 
     if report:
@@ -250,8 +261,9 @@ def fit_fooof(f, pxx, aperiodic_mode='fixed', dB_threshold=3., max_n_peaks=10,
     return results, fm
 
 
-def plot_channel_psd(psd, channel_id=None, freq_range=200., plt_range=(0, 100.), figsize=(5, 4),
-                 aperiodic_mode='knee', dB_threshold=3., max_n_peaks=10, plt_log=True):
+def plot_channel_psd(psd, channel_id=None, plt_range=(0, 100.),
+                     aperiodic_mode='knee', freq_range=200., plt_log=True,
+                     figsize=(5, 4), **fooof_params):
     """Plot PSD at given chennel with FOOOF results"""
     plt_range = np.array(plt_range)
     if plt_range.size == 1:
@@ -269,13 +281,13 @@ def plot_channel_psd(psd, channel_id=None, freq_range=200., plt_range=(0, 100.),
     fig1 = plt.gcf()
 
     if channel_id is None:
-        channel_id = psd.channel[0]
+        channel_id = psd.channel[0].item()
     print(f'Channel: {channel_id: d}')
     psd_plt = psd.sel(channel=channel_id)
     results = fit_fooof(psd_plt.frequency.values, psd_plt.values,
-                        aperiodic_mode=aperiodic_mode, dB_threshold=dB_threshold, max_n_peaks=max_n_peaks,
-                        freq_range=freq_range, peak_width_limits=None, report=True,
-                        plot=True, plt_log=plt_log, plt_range=plt_range[1], figsize=figsize)
+                        aperiodic_mode=aperiodic_mode, freq_range=freq_range,
+                        report=True, plt_log=plt_log, **fooof_params,
+                        plot=True, plt_range=plt_range[1], figsize=figsize)
     fig2 = plt.gcf()
     return results, fig1, fig2
 
@@ -372,7 +384,20 @@ def cwt_spectrogram_xarray(x, fs, axis=-1, downsample_fs=None, channel_coords=No
     sxx = sxx.assign(cone_of_influence_frequency=xr.DataArray(coif, coords={'time': t}))
     return sxx
 
-def plot_spectrogram(sxx_xarray, remove_aperiodic=None, plt_log=False,
+
+def spectrogram_xarray(x, fs, tseg, axis=-1, tres=np.inf, channel_coords=None):
+    x = np.asarray(x)
+    nfft = int(tseg * fs) # steps per segment
+    noverlap = int(max(tseg - tres, 0) * fs)
+    f, t, sxx = ss.spectrogram(np.moveaxis(x, axis, -1), fs=fs,
+                               nperseg=nfft, noverlap=noverlap, window='boxcar')
+    if channel_coords is None:
+        channel_coords = {f'dim_{i:d}': range(d) for i, d in enumerate(sxx.shape[:-2])}
+    sxx = xr.DataArray(sxx, coords={**channel_coords, 'frequency': f, 'time': t}).to_dataset(name='PSD')
+    return sxx
+
+
+def plot_spectrogram(sxx_xarray, remove_aperiodic=None, log_power=False,
                      plt_range=None, clr_freq_range=None, ax=None):
     """Plot spectrogram. Determine color limits using value in frequency band clr_freq_range"""
     sxx = sxx_xarray.PSD.values.copy()
@@ -380,7 +405,7 @@ def plot_spectrogram(sxx_xarray, remove_aperiodic=None, plt_log=False,
     f = sxx_xarray.frequency.values.copy()
 
     cbar_label = 'PSD' if remove_aperiodic is None else 'PSD Residual'
-    if plt_log:
+    if log_power:
         with np.errstate(divide='ignore'):
             sxx = np.log10(sxx)
         cbar_label += ' log(power)'
@@ -388,14 +413,14 @@ def plot_spectrogram(sxx_xarray, remove_aperiodic=None, plt_log=False,
     if remove_aperiodic is not None:
         f1_idx = 0 if f[0] else 1
         ap_fit = gen_aperiodic(f[f1_idx:], remove_aperiodic.aperiodic_params)
-        sxx[f1_idx:, :] -= (ap_fit if plt_log else 10 ** ap_fit)[:, None]
+        sxx[f1_idx:, :] -= (ap_fit if log_power else 10 ** ap_fit)[:, None]
         sxx[:f1_idx, :] = 0.
 
     if ax is None:
         _, ax = plt.subplots(1, 1)
     plt_range = np.array(f[-1]) if plt_range is None else np.array(plt_range)
     if plt_range.size == 1:
-        plt_range = [f[0 if f[0] else 1] if plt_log else 0., plt_range.item()]
+        plt_range = [f[0 if f[0] else 1] if log_power else 0., plt_range.item()]
     f_idx = (f >= plt_range[0]) & (f <= plt_range[1])
     if clr_freq_range is None:
         vmin, vmax = None, None
